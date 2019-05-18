@@ -1,0 +1,344 @@
+﻿#pragma kernel CSMain
+
+struct Sphere
+{
+  float3 position;
+  float radius;
+  float3 albedo;
+  float3 specular;
+  float smoothness;
+  float3 emission;
+};
+
+struct MeshObject
+{
+  float4x4 localToWorldMatrix;
+  int indices_offset;
+  int indices_count;
+};
+
+struct Ray
+{
+  float3 origin;
+  float3 direction;
+  float3 energy;
+};
+
+struct RayHit
+{
+  float3 position;
+  float distance;
+  float3 normal;
+  float3 albedo;
+  float3 specular;
+  float smoothness;
+  float3 emission;
+};
+
+static const float PI = 3.14159265f;
+static const int N_BOUNCES = 8;
+static const float EPSILON_3 = 0.001f;
+static const float EPSILON = 1e-8;
+
+Texture2D<float4> skyboxTexture;
+SamplerState sampler_skyboxTexture;
+
+StructuredBuffer<Sphere> spheres;
+StructuredBuffer<MeshObject> meshObjects;
+StructuredBuffer<float3> vertices;
+StructuredBuffer<int> indices;
+
+float4x4 cameraToWorld;
+float4x4 cameraInverseProjection;
+
+float2 pixelOffset;
+float4 directionalLight;
+
+float2 pixel;
+float seed;
+
+RWTexture2D<float4> result;
+
+float sdot(float3 x, float3 y, float f = 1.0f)
+{
+  return saturate(f * dot(x, y));
+}
+
+float energy(float3 color)
+{
+  return dot(color, 1.0f / 3.0f);
+}
+
+float rand()
+{
+  float result = frac(sin(seed / 100.0f * dot(pixel, float2(12.9898f, 78.233f))) * 43758.5453f);
+  seed += 1.0f;
+  return result;
+}
+
+float SmoothnessToPhongAlpha(float s)
+{
+  return pow(1000.0f, s * s);
+}
+
+float3x3 GetTangentSpace(float3 normal)
+{
+  // Choose a helper vector for the cross product
+  float3 helper = float3(1.0f, 0.0f, 0.0f);
+  if (abs(normal.x) > 0.99f)
+  {
+    helper = float3(0.0f, 0.0f, 1.0f);
+  }
+
+  // Generate vectors
+  float3 tangent = normalize(cross(normal, helper));
+  float3 binormal = normalize(cross(normal, tangent));
+  return float3x3(tangent, binormal, normal);
+}
+
+float3 SampleHemisphere(float3 normal, float alpha)
+{
+  // Uniformly sample hemisphere direction
+  float cosTheta = pow(rand(), 1.0f / (1.0f + alpha));
+  float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
+  float phi = 2.0f * PI * rand();
+  float3 tangentSpaceDir = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+  // Transform direction to world space
+  return mul(tangentSpaceDir, GetTangentSpace(normal));
+}
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+  Ray ray;
+  ray.origin = origin;
+  ray.direction = direction;
+  ray.energy = float3(1.0f, 1.0f, 1.0f);
+  return ray;
+}
+
+RayHit CreateRayHit()
+{
+  RayHit hit;
+  hit.position = float3(0.0f, 0.0f, 0.0f);
+  hit.distance = 1.#INF;
+  hit.normal = float3(0.0f, 0.0f, 0.0f);
+  hit.albedo = float3(0.0f, 0.0f, 0.0f);
+  hit.specular = float3(0.0f, 0.0f, 0.0f);
+  hit.smoothness = 0.0f;
+  hit.emission = float3(0.0f, 0.0f, 0.0f);
+  return hit;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+  // Transform the camera origin to world space
+  float3 origin = mul(cameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+  // Invert the perspective projection of the view-space position
+  float3 direction = mul(cameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+  // Transform the direction from camera to world space and normalize
+  direction = mul(cameraToWorld, float4(direction, 0.0f)).xyz;
+  direction = normalize(direction);
+
+  return CreateRay(origin, direction);
+}
+
+void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
+{
+  // Calculate the distance along the ray where the ground plane is intersected
+  float t = -ray.origin.y / ray.direction.y;
+  if (t > 0.0f && t < bestHit.distance)
+  {
+    bestHit.distance = t;
+    bestHit.position = ray.origin + t * ray.direction;
+    bestHit.normal = float3(0.0f, 1.0f, 0.0f);
+    bestHit.albedo = 0.5f;
+    bestHit.specular = 0.03f;
+    bestHit.smoothness = 0.2f;
+    bestHit.emission = float3(0.0f, 0.0f, 0.0f);
+  }
+}
+
+void IntersectSphere(Ray ray, inout RayHit bestHit, Sphere sphere)
+{
+  // Calculate the distance along the ray where the sphere is intersected
+  float3 d = ray.origin - sphere.position;
+  float p1 = -dot(ray.direction, d);
+  float p2sqr = p1 * p1 - dot(d, d) + sphere.radius * sphere.radius;
+  if (p2sqr < 0.0f)
+  {
+    return;
+  }
+
+  float p2 = sqrt(p2sqr);
+  float t = p1 - p2 > 0.0f ? p1 - p2 : p1 + p2;
+  if (t > 0.0f && t < bestHit.distance)
+  {
+    bestHit.distance = t;
+    bestHit.position = ray.origin + t * ray.direction;
+    bestHit.normal = normalize(bestHit.position - sphere.position);
+    bestHit.albedo = sphere.albedo;
+    bestHit.specular = sphere.specular;
+    bestHit.smoothness = sphere.smoothness;
+    bestHit.emission = sphere.emission;
+  }
+}
+
+bool IntersectTriangle_MT97(Ray ray, float3 vert0, float3 vert1, float3 vert2,
+  inout float t, inout float u, inout float v)
+{
+  // find vectors for two edges sharing vert0
+  float3 edge1 = vert1 - vert0;
+  float3 edge2 = vert2 - vert0;
+  // begin calculating determinant - also used to calculate U parameter
+  float3 pvec = cross(ray.direction, edge2);
+  // if determinant is near zero, ray lies in plane of triangle
+  float det = dot(edge1, pvec);
+  // use backface culling
+  if (det < EPSILON)
+    return false;
+  float inv_det = 1.0f / det;
+  // calculate distance from vert0 to ray origin
+  float3 tvec = ray.origin - vert0;
+  // calculate U parameter and test bounds
+  u = dot(tvec, pvec) * inv_det;
+  if (u < 0.0 || u > 1.0f)
+    return false;
+  // prepare to test V parameter
+  float3 qvec = cross(tvec, edge1);
+  // calculate V parameter and test bounds
+  v = dot(ray.direction, qvec) * inv_det;
+  if (v < 0.0 || u + v > 1.0f)
+    return false;
+  // calculate t, ray intersects triangle
+  t = dot(edge2, qvec) * inv_det;
+  return true;
+}
+
+void IntersectMeshObject(Ray ray, inout RayHit bestHit, MeshObject meshObject)
+{
+  uint offset = meshObject.indices_offset;
+  uint count = offset + meshObject.indices_count;
+  for (uint i = offset; i < count; i += 3)
+  {
+    float3 v0 = (mul(meshObject.localToWorldMatrix, float4(vertices[indices[i]], 1.0f))).xyz;
+    float3 v1 = (mul(meshObject.localToWorldMatrix, float4(vertices[indices[i + 1]], 1.0f))).xyz;
+    float3 v2 = (mul(meshObject.localToWorldMatrix, float4(vertices[indices[i + 2]], 1.0f))).xyz;
+
+    float t, u, v;
+    if (IntersectTriangle_MT97(ray, v0, v1, v2, t, u, v))
+    {
+      if (t > 0.0f && t < bestHit.distance)
+      {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(cross(v1 - v0, v2 - v0));
+        bestHit.albedo = 0.0f;
+        bestHit.specular = 0.65f;
+        bestHit.smoothness = 0.99f;
+        bestHit.emission = 0.0f;
+      }
+    }
+  }
+}
+
+RayHit Trace(Ray ray)
+{
+  RayHit bestHit = CreateRayHit();
+  uint count, stride, i;
+
+  IntersectGroundPlane(ray, bestHit);
+
+  spheres.GetDimensions(count, stride);
+  for (i = 0; i < count; i++)
+  {
+    IntersectSphere(ray, bestHit, spheres[i]);
+  }
+
+  meshObjects.GetDimensions(count, stride);
+  for (i = 0; i < count; i++)
+  {
+    IntersectMeshObject(ray, bestHit, meshObjects[i]);
+  }
+
+  return bestHit;
+}
+
+float3 Shade(inout Ray ray, RayHit hit)
+{
+  if (hit.distance < 1.#INF)
+  {
+    // Calculate the changes of diffuse and specular reflection
+    hit.albedo = min(1.0f - hit.specular, hit.albedo);
+    float specChance = energy(hit.specular);
+    float diffChance = energy(hit.albedo);
+
+
+    // Roulette-select the ray's path
+    float roulette = rand();
+    if (roulette < specChance)
+    {
+      // Specular reflection
+      ray.origin = hit.position + hit.normal * EPSILON_3;
+      float alpha = SmoothnessToPhongAlpha(hit.smoothness);
+      ray.direction = SampleHemisphere(reflect(ray.direction, hit.normal), alpha);
+      float f = (alpha + 2.0f) / (alpha + 1.0f);
+      ray.energy *= (1.0f / specChance) * hit.specular * sdot(hit.normal, ray.direction, f);
+    }
+    else if (diffChance > 0.0f && roulette < specChance + diffChance)
+    {
+      // Diffuse reflection
+      ray.origin = hit.position + hit.normal * EPSILON_3;
+      ray.direction = SampleHemisphere(hit.normal, 1.0f);
+      ray.energy *= (1.0f / diffChance) * hit.albedo;
+    }
+    else
+    {
+      // Terminate the ray
+      ray.energy = 0.0f;
+    }
+
+    return hit.emission;
+  }
+  else
+  {
+    // Erase the ray's energy - the sky doesn't reflect anything
+    ray.energy = float3(0.0f, 0.0f, 0.0f);
+
+    // Sample the skybox and write it
+    float theta = acos(ray.direction.y) / -PI;
+    float phi = 0.5f * atan2(ray.direction.x, -ray.direction.z) / PI;
+    return 1.2f * skyboxTexture.SampleLevel(sampler_skyboxTexture, float2(phi, theta), 0).xyz;
+  }
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+  pixel = id.xy;
+
+  // Get the dimensions of the RenderTexture
+  uint width, height;
+  result.GetDimensions(width, height);
+
+  // Transform pixel to [-1, 1] range
+  float2 uv = 2.0f * (float2(id.xy + pixelOffset) / float2(width, height)) - 1.0f;
+
+  // Get a ray from the UVs
+  Ray ray = CreateCameraRay(uv);
+
+  // Trace and shade
+  float3 color = float3(0.0f, 0.0f, 0.0f);
+  for (int i = 0; i < N_BOUNCES; i++)
+  {
+    RayHit hit = Trace(ray);
+    color += ray.energy * Shade(ray, hit);
+
+    if (!any(ray.energy))
+    {
+      break;
+    }
+  }
+  result[id.xy] = float4(color, 1.0f);
+}
